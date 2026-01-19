@@ -1,0 +1,238 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <DHT.h>
+#include <Wire.h>
+#include <Adafruit_BMP280.h>
+#include "HX711.h"
+
+// ==========================================
+// CONFIGURATION
+// ==========================================
+
+// WiFi Credentials
+const char* SSID = "Tanmay_a1";         // REPLACE WITH YOUR SSID
+const char* PASSWORD = "1122334455"; // REPLACE WITH YOUR PASSWORD
+
+// Server Endpoint
+const char* SERVER_URL = "http://10.127.234.163:3000/api/ingest"; 
+
+// ==========================================
+// PIN DEFINITIONS
+// ==========================================
+
+// DHT11 Sensors
+#define PIN_DHT_ZONE1 18
+#define PIN_DHT_ZONE2 19
+
+// HX711 (HX710B) Pressure Sensor
+#define PIN_PRESSURE_DT 26
+#define PIN_PRESSURE_SCK 27
+
+// BMP280 (HW-611) I2C Pins
+#define PIN_I2C_SDA 21
+#define PIN_I2C_SCL 22
+
+// LDR (Light Sensor) - Digital Input
+#define PIN_LDR 34
+
+// Rain Sensors
+#define PIN_RAIN1_ANALOG 35  // MH RD Analog
+#define PIN_RAIN1_DIGITAL 32 // MH RD Digital
+#define PIN_RAIN2_ANALOG 33  // HW611 Analog
+
+// On-board LED
+#define PIN_ONBOARD_LED 2
+
+// Component Settings
+#define DHT_TYPE DHT11
+
+// ==========================================
+// OBJECT INSTANTIATION
+// ==========================================
+
+DHT dht1(PIN_DHT_ZONE1, DHT_TYPE);
+DHT dht2(PIN_DHT_ZONE2, DHT_TYPE);
+
+HX711 pressureSensor;  // Original Sensor
+Adafruit_BMP280 bmp;   // New Sensor
+
+// Global Flags
+bool bmpFound = false;
+
+// ==========================================
+// GLOBAL VARIABLES
+// ==========================================
+
+unsigned long lastSendTime = 0;
+const unsigned long sendInterval = 2000; 
+
+// ==========================================
+// HELPER FUNCTIONS
+// ==========================================
+
+void connectToWiFi() {
+  Serial.print("Connecting to WiFi");
+  WiFi.begin(SSID, PASSWORD);
+  
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    digitalWrite(PIN_ONBOARD_LED, !digitalRead(PIN_ONBOARD_LED)); 
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  
+  digitalWrite(PIN_ONBOARD_LED, LOW); 
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWiFi connected.");
+    Serial.print("IP: ");
+    Serial.println(WiFi.localIP());
+    // Signal success
+    for(int i=0; i<3; i++) { digitalWrite(PIN_ONBOARD_LED, HIGH); delay(50); digitalWrite(PIN_ONBOARD_LED, LOW); delay(50); }
+  } else {
+    Serial.println("\nWiFi connection failed.");
+  }
+}
+
+float normalizeRain(int rawValue) {
+  int constrained = constrain(rawValue, 0, 4095);
+  return 1.0 - ((float)constrained / 4095.0);
+}
+
+// ==========================================
+// SETUP
+// ==========================================
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println("Starting IoT Weather Monitor (Restored)...");
+
+  pinMode(PIN_ONBOARD_LED, OUTPUT);
+  digitalWrite(PIN_ONBOARD_LED, LOW); 
+
+  // 1. Initialize DHT
+  dht1.begin();
+  dht2.begin();
+
+  // 2. Initialize HX711 (Original Sensor)
+  // We do this early to ensure pins are set correctly
+  Serial.println("Initializing HX711...");
+  pressureSensor.begin(PIN_PRESSURE_DT, PIN_PRESSURE_SCK);
+
+  // 3. Initialize BMP280 (New Sensor) - I2C
+  Serial.println("Initializing BMP280...");
+  Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
+  if (bmp.begin(0x76)) {
+    bmpFound = true;
+    Serial.println("SUCCESS: BMP280 Found at 0x76");
+  } else if (bmp.begin(0x77)) {
+    bmpFound = true;
+    Serial.println("SUCCESS: BMP280 Found at 0x77");
+  } else {
+    Serial.println("ERROR: BMP280 Not Found! Check Wiring (SDA=21, SCL=22).");
+  }
+
+  // 4. Pin Modes
+  pinMode(PIN_LDR, INPUT);
+  pinMode(PIN_RAIN1_ANALOG, INPUT);
+  pinMode(PIN_RAIN1_DIGITAL, INPUT);
+  pinMode(PIN_RAIN2_ANALOG, INPUT);
+
+  connectToWiFi();
+}
+
+// ==========================================
+// LOOP
+// ==========================================
+
+void loop() {
+  if (WiFi.status() != WL_CONNECTED) {
+    connectToWiFi();
+  }
+
+  unsigned long currentTime = millis();
+  if (currentTime - lastSendTime >= sendInterval) {
+    lastSendTime = currentTime;
+
+    // --- READINGS ---
+
+    // 1. DHT
+    float t1 = dht1.readTemperature();
+    float h1 = dht1.readHumidity();
+    float t2 = dht2.readTemperature();
+    float h2 = dht2.readHumidity();
+
+    if (isnan(t1)) t1 = 0; if (isnan(h1)) h1 = 0;
+    if (isnan(t2)) t2 = 0; if (isnan(h2)) h2 = 0;
+
+    // 2. LDR (Digital)
+    // Assuming Module: LOW = Light, HIGH = Dark (or verify with flashlight)
+    int ldrState = digitalRead(PIN_LDR); 
+    String dayNightStatus = (ldrState == LOW) ? "DAY" : "NIGHT"; 
+
+    // 3. Rain
+    float r1 = normalizeRain(analogRead(PIN_RAIN1_ANALOG));
+    float r2 = normalizeRain(analogRead(PIN_RAIN2_ANALOG));
+    float avgRain = (r1 + r2) / 2.0;
+    bool rainDetected = (digitalRead(PIN_RAIN1_DIGITAL) == LOW) || (avgRain > 0.4);
+
+    // 4. Pressure: BMP280 (New)
+    float p_bmp = 0.0;
+    if (bmpFound) {
+      p_bmp = bmp.readPressure() / 100.0F; // hPa
+      if (isnan(p_bmp)) p_bmp = 0.0;
+    }
+
+    // 5. Pressure: HX711 (Original)
+    // Using previous simplified logic: Reading    // Wind Speed (HX711 repurposed)
+    float windSpeed = 0.0;
+    if (pressureSensor.is_ready()) {
+      long reading = pressureSensor.read();
+      windSpeed = abs(reading) / 1000.0; // Use abs() to avoid negative wind speed
+      Serial.printf("Wind Speed Raw: %ld, Scaled: %.2f\n", reading, windSpeed);
+    } else {
+      Serial.println("Wind Sensor (HX711) NOT READY");
+    }
+
+    // --- PAYLOAD ---
+    JsonDocument doc;
+    
+    JsonObject z1 = doc["zone1"].to<JsonObject>();
+    z1["temperature"] = t1;
+    z1["humidity"] = h1;
+
+    JsonObject z2 = doc["zone2"].to<JsonObject>();
+    z2["temperature"] = t2;
+    z2["humidity"] = h2;
+
+    doc["pressure"] = p_bmp;         // BMP280
+    doc["wind_speed"] = windSpeed;   // HX711 (Repurposed)
+    doc["rain_raw"] = avgRain;     
+    doc["rain_detected"] = rainDetected; 
+    doc["ldr"] = ldrState;           
+    doc["day_night"] = dayNightStatus;
+
+    String jsonString;
+    serializeJson(doc, jsonString);
+
+    // --- SEND ---
+    HTTPClient http;
+    http.begin(SERVER_URL);
+    http.addHeader("Content-Type", "application/json");
+    
+    int httpResponseCode = http.POST(jsonString);
+    
+    if (httpResponseCode > 0) {
+      Serial.printf("Payload sent: %d bytes. Response: %d\n", jsonString.length(), httpResponseCode);
+      digitalWrite(PIN_ONBOARD_LED, HIGH); delay(10); digitalWrite(PIN_ONBOARD_LED, LOW);
+    } else {
+      Serial.printf("Error sending: %d\n", httpResponseCode);
+    }
+    http.end();
+  }
+}
+
